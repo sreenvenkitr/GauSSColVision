@@ -43,7 +43,7 @@ async def vision_query(
     # 1. Parse JSON metadata
     try:
         req_dict = json.loads(metadata)
-        request = VisionQueryRequest.parse_obj(req_dict)
+        request = VisionQueryRequest.model_validate(req_dict) if hasattr(VisionQueryRequest, "model_validate") else VisionQueryRequest.parse_obj(req_dict)
     except Exception as err:
         logger.error(f"Failed to parse query metadata: {err}")
         raise HTTPException(status_code=422, detail=f"Invalid query metadata: {str(err)}")

@@ -46,7 +46,7 @@ def test_vision_query_response_serialization():
         uncertainty=None,
         recommended_next_view=RecommendedNextView(required=False)
     )
-    data = resp.dict()
+    data = resp.model_dump() if hasattr(resp, "model_dump") else resp.dict()
     assert data["answer"] == "A chair is located on the left."
     assert len(data["observations"]) == 1
     assert data["observations"][0]["bbox"]["x_min"] == 0.2

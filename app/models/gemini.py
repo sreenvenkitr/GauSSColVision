@@ -49,9 +49,9 @@ class GeminiVLM(VisionLanguageModel):
         user_prompt = build_user_prompt(
             question=request.question,
             query_scope=request.query_scope.value,
-            views_meta=[v.dict() for v in request.views],
-            roi_box=request.roi.dict() if request.roi else None,
-            conversation_history=[t.dict() for t in request.conversation_history]
+            views_meta=[v.model_dump() if hasattr(v, "model_dump") else v.dict() for v in request.views],
+            roi_box=(request.roi.model_dump() if hasattr(request.roi, "model_dump") else request.roi.dict()) if request.roi else None,
+            conversation_history=[t.model_dump() if hasattr(t, "model_dump") else t.dict() for t in request.conversation_history]
         )
 
         parts = []
