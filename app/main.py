@@ -41,7 +41,10 @@ async def startup_event():
     logger.info("==================================================")
     logger.info("Starting GauSSColVision Service")
     logger.info(f"Host: {settings.host}:{settings.port}")
-    logger.info(f"VLM Provider: Gemini Cloud API ({settings.gemini_model})")
+    if settings.vision_provider in ("openrouter", "openai", "openai_compatible"):
+        logger.info(f"VLM Provider: OpenAI-Compatible / OpenRouter ({settings.openrouter_model} at {settings.openrouter_base_url})")
+    else:
+        logger.info(f"VLM Provider: Gemini Cloud API ({settings.gemini_model})")
     logger.info(f"Mock Mode: {settings.use_mock_model}")
     logger.info(f"SAM 2.1 Enabled: {settings.sam_enabled}")
     logger.info("==================================================")

@@ -1,8 +1,35 @@
+"""
+Visual Reasoning Service Module for GauSSCol Vision.
+
+This module orchestrates the end-to-end multimodal reasoning pipeline connecting WebGPU multi-view
+renders, Vision-Language Model (Gemini/VLM) spatial reasoning, and SAM 2.1 neural segmentation.
+
+Architectural Rationale:
+In GauSSCol, 3D Gaussian selection occurs via a multi-view visual feedback loop:
+1. Multi-View Rendering: GauSSColUI's WebGPU rasterizer captures camera views (e.g. current viewport,
+   orbiting angles, top-down perspectives).
+2. Image Preprocessing: Images are standardized and scaled for optimal VLM throughput.
+3. Multimodal Reasoning: The VLM reasons across viewpoints to ground the user's intent, locating
+   candidate target objects with 2D bounding boxes and geometric hints.
+4. Structured Parsing: Raw text is parsed into typed domain models with automatic error recovery.
+5. Multi-View Segmentation: SAM 2.1 executes zero-shot mask segmentation across visible viewpoints,
+   prioritizing the user's active viewport ('current').
+6. Telemetry & Metrics: Granular timing breakdowns and memory metrics are attached for frontend profiling.
+
+To prevent bloated procedural methods, this module separates responsibilities into modular classes:
+- GroundedViewCollector: Filters, validates, and prioritizes viewpoints containing bounding boxes.
+- TargetLabelResolver: Resolves clean, human-readable labels from prompt text and model output.
+- SegmentationCoordinator: Manages multi-view SAM 2.1 execution and mask aggregation.
+- TelemetryCollector: Gathers latency metrics, GPU memory usage, and debug payloads.
+- VisualReasoningService: High-level facade coordinating the complete reasoning workflow.
+"""
+
 import time
 import uuid
 import re
 import logging
 from typing import Dict, Any, List, Optional, Tuple
+
 import torch
 from PIL import Image
 
@@ -27,12 +54,344 @@ from .response_parser import StructuredResponseParser
 
 logger = logging.getLogger("gausscol_vision.reasoning")
 
+
 def _extract_bounding_box(bbox_data: Any) -> Optional[NormalizedBBox]:
     """
     Backward-compatibility function delegating to StructuredResponseParser.
     Preserves module-level import contract for tests and external scripts.
     """
     return StructuredResponseParser().extract_bounding_box(bbox_data)
+
+
+class GroundedViewCollector:
+    """
+    Responsible for identifying, validating, and prioritizing viewpoints that contain
+    valid bounding box targets for SAM 2.1 segmentation.
+
+    Key Behaviors:
+    - Extracts grounded candidates from 'grounded_views', 'views', or 'observations'.
+    - Filters candidates by minimum confidence (settings.gemini_grounding_min_confidence).
+    - Employs a fallback policy: if strict filtering yields 0 views, accepts any viewpoint
+      with a valid bounding box so segmentation can proceed.
+    - Viewport Prioritization: Always sorts the active camera view ('current') to index 0,
+      ensuring the user's direct perspective is processed first.
+    """
+
+    def __init__(self, response_parser: Optional[StructuredResponseParser] = None):
+        self.response_parser = response_parser or StructuredResponseParser()
+
+    def collect_valid_views(
+        self,
+        raw_data: dict,
+        parsed_response: VisionQueryResponse,
+        images: Dict[str, Image.Image],
+        query_id: str
+    ) -> List[Tuple[str, float, NormalizedBBox]]:
+        """
+        Extracts, filters, and sorts candidate viewpoints for segmentation.
+
+        Returns:
+            List of tuples: (view_id, confidence, NormalizedBBox)
+        """
+        grounded_entries = self._extract_raw_entries(raw_data, parsed_response)
+        min_conf = settings.gemini_grounding_min_confidence
+
+        valid_views: List[Tuple[str, float, NormalizedBBox]] = []
+
+        # 1. Primary pass with strict confidence threshold
+        for entry in grounded_entries:
+            parsed_item = self._parse_entry(entry, images)
+            if parsed_item:
+                vid, conf, bbox = parsed_item
+                if conf >= min_conf:
+                    valid_views.append((vid, conf, bbox))
+
+        # 2. Fallback pass if strict threshold rejected all candidate viewpoints
+        if not valid_views and grounded_entries:
+            logger.info(
+                f"[QUERY:{query_id}] Threshold {min_conf} filtered all views; trying fallback..."
+            )
+            for entry in grounded_entries:
+                parsed_item = self._parse_entry(entry, images)
+                if parsed_item:
+                    valid_views.append(parsed_item)
+
+        # 3. Sort viewpoints: ensure 'current' active viewport is first (index 0)
+        valid_views.sort(key=lambda x: 0 if x[0] == "current" else 1)
+
+        return valid_views
+
+    def _extract_raw_entries(self, raw_data: dict, parsed_response: VisionQueryResponse) -> List[Any]:
+        """
+        Extracts candidate entries from heterogeneous VLM dictionary structures.
+        """
+        if "grounded_views" in raw_data and raw_data["grounded_views"]:
+            return raw_data["grounded_views"]
+        if "views" in raw_data and raw_data["views"]:
+            return raw_data["views"]
+        if "observations" in raw_data and raw_data["observations"]:
+            return raw_data["observations"]
+
+        # Synthesize from parsed observations if dictionary had no direct view lists
+        if parsed_response.observations:
+            return [
+                {
+                    "view_id": obs.view_id,
+                    "visible": True,
+                    "confidence": obs.confidence if obs.confidence is not None else 0.85,
+                    "bbox": obs.bbox
+                }
+                for obs in parsed_response.observations
+                if obs.bbox is not None
+            ]
+
+        return []
+
+    def _parse_entry(
+        self,
+        entry: Any,
+        images: Dict[str, Image.Image]
+    ) -> Optional[Tuple[str, float, NormalizedBBox]]:
+        """
+        Validates an individual entry against available images and bounding box parsing.
+        """
+        if not isinstance(entry, dict):
+            return None
+
+        vid = str(entry.get("view_id", ""))
+        vis = bool(entry.get("visible", True))
+        conf = float(entry.get("confidence", 0.0)) if entry.get("confidence") is not None else 0.85
+
+        raw_bbox = entry.get("bbox") or entry.get("box_2d")
+        bbox_obj = self.response_parser.extract_bounding_box(raw_bbox)
+
+        if vid in images and vis and bbox_obj:
+            return (vid, conf, bbox_obj)
+
+        return None
+
+
+class TargetLabelResolver:
+    """
+    Responsible for resolving and standardizing user-facing object labels.
+    """
+
+    @staticmethod
+    def resolve_label(question: str, parsed_response: VisionQueryResponse) -> str:
+        """
+        Extracts a clean, human-readable label from the target object or question.
+        """
+        if (
+            parsed_response.target
+            and parsed_response.target.label
+            and parsed_response.target.label.lower() not in ("object", "target object", "target")
+        ):
+            return parsed_response.target.label
+
+        cleaned = TargetLabelResolver._clean_question(question)
+        if cleaned:
+            if parsed_response.target:
+                parsed_response.target.label = cleaned
+                parsed_response.target.description = cleaned
+            else:
+                parsed_response.target = TargetObject(label=cleaned, description=cleaned)
+            return cleaned
+
+        return "object"
+
+    @staticmethod
+    def _clean_question(question: str) -> str:
+        """
+        Strips imperative verbs and spatial prepositions from the prompt.
+        """
+        cleaned = re.sub(
+            r"^(select|highlight|segment|isolate|pick|find)\s+(the\s+)?",
+            "",
+            question,
+            flags=re.I
+        ).strip()
+        cleaned = re.sub(
+            r"\s+(in\s+the\s+(scene|room|view)|from\s+the\s+scene).*$",
+            "",
+            cleaned,
+            flags=re.I
+        ).strip()
+        return cleaned
+
+
+class SegmentationCoordinator:
+    """
+    Responsible for orchestrating multi-view SAM 2.1 neural segmentation when intent is SELECT_OBJECT.
+    """
+
+    def __init__(
+        self,
+        view_collector: Optional[GroundedViewCollector] = None,
+        label_resolver: Optional[TargetLabelResolver] = None
+    ):
+        self.view_collector = view_collector or GroundedViewCollector()
+        self.label_resolver = label_resolver or TargetLabelResolver()
+
+    def coordinate(
+        self,
+        request: VisionQueryRequest,
+        parsed_response: VisionQueryResponse,
+        raw_data: dict,
+        images: Dict[str, Image.Image],
+        query_id: str
+    ) -> Tuple[float, List[Tuple[str, float, NormalizedBBox]]]:
+        """
+        Runs SAM 2.1 across valid grounded viewpoints and populates parsed_response.segmentation.
+
+        Returns:
+            Tuple of (total_sam_latency_ms, list_of_valid_views)
+        """
+        valid_views: List[Tuple[str, float, NormalizedBBox]] = []
+        sam_total_ms = 0.0
+
+        # Only execute segmentation if intent is SELECT_OBJECT and requires_segmentation is True
+        if not (parsed_response.intent == IntentType.SELECT_OBJECT and parsed_response.requires_segmentation):
+            return sam_total_ms, valid_views
+
+        from .sam2_service import get_sam2_service
+
+        if not settings.sam_enabled:
+            logger.info(f"[QUERY:{query_id}] SAM is disabled by configuration.")
+            parsed_response.answer = "Object identified, but segmentation service is unavailable (SAM_ENABLED=false)."
+            parsed_response.requires_segmentation = False
+            return sam_total_ms, valid_views
+
+        sam_service = get_sam2_service()
+        target_label = self.label_resolver.resolve_label(request.question, parsed_response)
+
+        # Collect validated viewpoints
+        valid_views = self.view_collector.collect_valid_views(raw_data, parsed_response, images, query_id)
+
+        if not valid_views:
+            logger.warning(f"[QUERY:{query_id}] No views satisfied grounding threshold for '{target_label}'.")
+            parsed_response.answer = f"I could not confidently locate '{target_label}' in the available views."
+            parsed_response.requires_segmentation = False
+            return sam_total_ms, valid_views
+
+        logger.info(
+            f"[QUERY:{query_id}] Running SAM 2.1 across {len(valid_views)} grounded view(s) for '{target_label}'..."
+        )
+
+        sam_start = time.time()
+        sam_mask_results: List[SAMMaskResult] = []
+
+        for vid, gem_conf, bbox_obj in valid_views:
+            orig_img = images[vid]
+            try:
+                sam_res = sam_service.segment_image(orig_img, bbox_obj)
+                if sam_res["foreground_pixel_count"] == 0:
+                    logger.warning(f"[QUERY:{query_id}] SAM returned empty mask for view '{vid}'.")
+                    continue
+
+                sam_mask_results.append(SAMMaskResult(
+                    view_id=vid,
+                    gemini_confidence=gem_conf,
+                    sam_confidence=sam_res["confidence"],
+                    bbox=bbox_obj,
+                    mask_png_base64=sam_res["mask_png_base64"],
+                    width=sam_res["width"],
+                    height=sam_res["height"],
+                    foreground_pixel_count=sam_res["foreground_pixel_count"]
+                ))
+            except Exception as sam_err:
+                logger.error(f"[QUERY:{query_id}] SAM error on view '{vid}': {sam_err}")
+
+        sam_total_ms = (time.time() - sam_start) * 1000.0
+
+        if sam_mask_results:
+            parsed_response.segmentation = SegmentationResult(views=sam_mask_results)
+            parsed_response.answer = f"Selected '{target_label}' across {len(sam_mask_results)} supporting viewpoints."
+        else:
+            parsed_response.answer = f"Object '{target_label}' identified, but SAM mask generation produced zero foreground pixels."
+            parsed_response.requires_segmentation = False
+
+        return sam_total_ms, valid_views
+
+
+class TelemetryCollector:
+    """
+    Responsible for compiling latency metrics, GPU allocation, debug diagnostics, and audit logs.
+    """
+
+    @staticmethod
+    def attach_and_log(
+        parsed_response: VisionQueryResponse,
+        query_id: str,
+        model_info: Dict[str, Any],
+        images: Dict[str, Image.Image],
+        valid_views: List[Tuple[str, float, NormalizedBBox]],
+        timings: Dict[str, float]
+    ) -> None:
+        """
+        Constructs PerformanceMetrics and debug_info and writes execution logs.
+        """
+        gpu_mem = None
+        if torch.cuda.is_available():
+            try:
+                gpu_mem = torch.cuda.memory_allocated() / (1024 * 1024)
+            except Exception:
+                gpu_mem = None
+
+        image_prep_ms = timings.get("image_prep_ms", 0.0)
+        prompt_prep_ms = timings.get("prompt_prep_ms", 0.0)
+        gemini_ms = timings.get("gemini_ms", 0.0)
+        parse_ms = timings.get("parse_ms", 0.0)
+        sam_total_ms = timings.get("sam_total_ms", 0.0)
+        total_ms = timings.get("total_ms", 0.0)
+
+        parsed_response.metrics = PerformanceMetrics(
+            image_prep_ms=round(image_prep_ms, 2),
+            prompt_prep_ms=round(prompt_prep_ms, 2),
+            inference_ms=round(gemini_ms, 2),
+            parse_ms=round(parse_ms, 2),
+            gemini_ms=round(gemini_ms, 2),
+            sam_total_ms=round(sam_total_ms, 2),
+            total_ms=round(total_ms, 2),
+            device=model_info.get("device", "cpu"),
+            gpu_memory_allocated_mb=round(gpu_mem, 1) if gpu_mem else None
+        )
+
+        target_dict = None
+        if parsed_response.target:
+            target_dict = (
+                parsed_response.target.model_dump()
+                if hasattr(parsed_response.target, 'model_dump')
+                else parsed_response.target.dict()
+            )
+
+        parsed_response.debug_info = {
+            "model": model_info.get("name", "Gemini"),
+            "intent": parsed_response.intent.value,
+            "target": target_dict,
+            "views_sent": list(images.keys()),
+            "views_grounded_count": len(valid_views),
+            "grounded_views": [v[0] for v in valid_views],
+            "gemini_ms": round(gemini_ms, 1),
+            "sam_ms": round(sam_total_ms, 1),
+            "total_ms": round(total_ms, 1),
+            "sam_mask_count": len(parsed_response.segmentation.views) if parsed_response.segmentation else 0
+        }
+
+        # Log summary
+        logger.info(
+            f"[QUERY:{query_id}] Finished in {total_ms:.1f}ms. "
+            f"Intent: {parsed_response.intent.value}, "
+            f"Segmentation: {bool(parsed_response.segmentation and parsed_response.segmentation.views)}"
+        )
+        logger.info(f"[QUERY:{query_id}] === ANSWER ===")
+        logger.info(f"[QUERY:{query_id}] {parsed_response.answer}")
+
+        if parsed_response.segmentation and parsed_response.segmentation.views:
+            logger.info(f"[QUERY:{query_id}] === SAM SEGMENTATION ({len(parsed_response.segmentation.views)} views) ===")
+            for sm in parsed_response.segmentation.views:
+                logger.info(f"[QUERY:{query_id}] - [{sm.view_id}] sam_conf={sm.sam_confidence}, fg_pixels={sm.foreground_pixel_count}")
+        logger.info(f"[QUERY:{query_id}] ====================")
+
 
 class VisualReasoningService:
     """
@@ -49,12 +408,20 @@ class VisualReasoningService:
         model: Optional[VisionLanguageModel] = None,
         preprocessor: Optional[ImagePreprocessor] = None,
         prompt_engine: Optional[ScenePromptEngine] = None,
-        response_parser: Optional[StructuredResponseParser] = None
+        response_parser: Optional[StructuredResponseParser] = None,
+        view_collector: Optional[GroundedViewCollector] = None,
+        segmentation_coordinator: Optional[SegmentationCoordinator] = None,
+        telemetry_collector: Optional[TelemetryCollector] = None
     ):
         self.model = model or get_vlm_model()
         self.preprocessor = preprocessor or ImagePreprocessor(max_dimension=384)
         self.prompt_engine = prompt_engine or ScenePromptEngine()
         self.response_parser = response_parser or StructuredResponseParser()
+        self.view_collector = view_collector or GroundedViewCollector(self.response_parser)
+        self.segmentation_coordinator = segmentation_coordinator or SegmentationCoordinator(
+            view_collector=self.view_collector
+        )
+        self.telemetry_collector = telemetry_collector or TelemetryCollector()
 
     def process_query(self, request: VisionQueryRequest, images: Dict[str, Image.Image]) -> VisionQueryResponse:
         """
@@ -63,7 +430,6 @@ class VisualReasoningService:
         query_id = str(uuid.uuid4())[:8]
         start_total = time.time()
 
-        # Log request metadata without serializing image bytes
         image_dims = {k: f"{v.width}x{v.height}" for k, v in images.items()}
         logger.info(
             f"[QUERY:{query_id}] Received query - Scope: {request.query_scope.value}, "
@@ -71,14 +437,16 @@ class VisualReasoningService:
             f"Question: '{request.question}'"
         )
 
-        # 1. Image preprocessing: Downscale images for VLM throughput
+        # 1. Downscale images for VLM throughput
         processed_images, image_prep_ms = self._prepare_images(images)
 
-        # 2. Prompt preparation (legacy timer metric retained for telemetry compatibility)
+        # 2. Prompt preparation (retained for telemetry compatibility)
         prompt_prep_ms = 0.0
 
         # 3. Model inference: Call Gemini / VLM
-        raw_response, gemini_ms, error_response = self._call_vlm(request, processed_images, query_id, start_total, image_prep_ms, prompt_prep_ms)
+        raw_response, gemini_ms, error_response = self._call_vlm(
+            request, processed_images, query_id, start_total, image_prep_ms, prompt_prep_ms
+        )
         if error_response:
             return error_response
 
@@ -180,95 +548,21 @@ class VisualReasoningService:
         query_id: str
     ) -> Tuple[float, List[Tuple[str, float, NormalizedBBox]]]:
         """
-        Orchestrates multi-view SAM 2.1 segmentation when the intent is SELECT_OBJECT.
+        Delegates multi-view SAM 2.1 segmentation coordination to SegmentationCoordinator.
         """
-        valid_views: List[Tuple[str, float, NormalizedBBox]] = []
-        sam_total_ms = 0.0
-
-        if not (parsed_response.intent == IntentType.SELECT_OBJECT and parsed_response.requires_segmentation):
-            return sam_total_ms, valid_views
-
-        from .sam2_service import get_sam2_service
-
-        if not settings.sam_enabled:
-            logger.info(f"[QUERY:{query_id}] SAM is disabled by configuration.")
-            parsed_response.answer = "Object identified, but segmentation service is unavailable (SAM_ENABLED=false)."
-            parsed_response.requires_segmentation = False
-            return sam_total_ms, valid_views
-
-        sam_service = get_sam2_service()
-
-        # Extract target label
-        target_label = self._extract_target_label(request.question, parsed_response)
-
-        # Collect grounded view candidates meeting confidence thresholds
-        valid_views = self._filter_segmentation_views(raw_data, parsed_response, images, query_id)
-
-        if not valid_views:
-            logger.warning(f"[QUERY:{query_id}] No views satisfied grounding threshold for '{target_label}'.")
-            parsed_response.answer = f"I could not confidently locate '{target_label}' in the available views."
-            parsed_response.requires_segmentation = False
-            return sam_total_ms, valid_views
-
-        # Sort viewpoints so the user's active viewport ('current') is always processed first (index 0)
-        valid_views.sort(key=lambda x: 0 if x[0] == "current" else 1)
-        logger.info(
-            f"[QUERY:{query_id}] Running SAM 2.1 across {len(valid_views)} grounded view(s) for '{target_label}'..."
+        return self.segmentation_coordinator.coordinate(
+            request=request,
+            parsed_response=parsed_response,
+            raw_data=raw_data,
+            images=images,
+            query_id=query_id
         )
-
-        sam_start = time.time()
-        sam_mask_results: List[SAMMaskResult] = []
-
-        for vid, gem_conf, bbox_obj in valid_views:
-            orig_img = images[vid]
-            try:
-                sam_res = sam_service.segment_image(orig_img, bbox_obj)
-                if sam_res["foreground_pixel_count"] == 0:
-                    logger.warning(f"[QUERY:{query_id}] SAM returned empty mask for view '{vid}'.")
-                    continue
-
-                sam_mask_results.append(SAMMaskResult(
-                    view_id=vid,
-                    gemini_confidence=gem_conf,
-                    sam_confidence=sam_res["confidence"],
-                    bbox=bbox_obj,
-                    mask_png_base64=sam_res["mask_png_base64"],
-                    width=sam_res["width"],
-                    height=sam_res["height"],
-                    foreground_pixel_count=sam_res["foreground_pixel_count"]
-                ))
-            except Exception as sam_err:
-                logger.error(f"[QUERY:{query_id}] SAM error on view '{vid}': {sam_err}")
-
-        sam_total_ms = (time.time() - sam_start) * 1000.0
-
-        if sam_mask_results:
-            parsed_response.segmentation = SegmentationResult(views=sam_mask_results)
-            parsed_response.answer = f"Selected '{target_label}' across {len(sam_mask_results)} supporting viewpoints."
-        else:
-            parsed_response.answer = f"Object '{target_label}' identified, but SAM mask generation produced zero foreground pixels."
-            parsed_response.requires_segmentation = False
-
-        return sam_total_ms, valid_views
 
     def _extract_target_label(self, question: str, parsed_response: VisionQueryResponse) -> str:
         """
         Extracts a clean, human-readable label for the target object from model output or the user question.
         """
-        if parsed_response.target and parsed_response.target.label and parsed_response.target.label.lower() not in ("object", "target object", "target"):
-            return parsed_response.target.label
-
-        cleaned_q = re.sub(r"^(select|highlight|segment|isolate|pick|find)\s+(the\s+)?", "", question, flags=re.I).strip()
-        cleaned_q = re.sub(r"\s+(in\s+the\s+(scene|room|view)|from\s+the\s+scene).*$", "", cleaned_q, flags=re.I).strip()
-        if cleaned_q:
-            if parsed_response.target:
-                parsed_response.target.label = cleaned_q
-                parsed_response.target.description = cleaned_q
-            else:
-                parsed_response.target = TargetObject(label=cleaned_q, description=cleaned_q)
-            return cleaned_q
-
-        return "object"
+        return TargetLabelResolver.resolve_label(question, parsed_response)
 
     def _filter_segmentation_views(
         self,
@@ -278,50 +572,9 @@ class VisualReasoningService:
         query_id: str
     ) -> List[Tuple[str, float, NormalizedBBox]]:
         """
-        Identifies and validates candidate viewpoints containing bounding boxes for SAM segmentation.
+        Delegates candidate viewpoint filtering to GroundedViewCollector.
         """
-        # Gather candidate entries from grounded_views, views, observations, or parsed observations
-        grounded_entries = raw_data.get("grounded_views", [])
-        if not grounded_entries and "views" in raw_data:
-            grounded_entries = raw_data["views"]
-        if not grounded_entries and "observations" in raw_data:
-            grounded_entries = raw_data["observations"]
-        if not grounded_entries and parsed_response.observations:
-            grounded_entries = [
-                {
-                    "view_id": obs.view_id,
-                    "visible": True,
-                    "confidence": obs.confidence if obs.confidence is not None else 0.85,
-                    "bbox": obs.bbox
-                }
-                for obs in parsed_response.observations
-                if obs.bbox is not None
-            ]
-
-        valid_views: List[Tuple[str, float, NormalizedBBox]] = []
-        for entry in grounded_entries:
-            vid = str(entry.get("view_id", ""))
-            vis = bool(entry.get("visible", True))
-            conf = float(entry.get("confidence", 0.0)) if entry.get("confidence") is not None else 0.85
-            raw_bbox = entry.get("bbox") or entry.get("box_2d")
-            bbox_obj = self.response_parser.extract_bounding_box(raw_bbox)
-
-            if vid in images and vis and conf >= settings.gemini_grounding_min_confidence and bbox_obj:
-                valid_views.append((vid, conf, bbox_obj))
-
-        # Fallback: If strict confidence threshold filtered all views, accept any viewpoint with a valid bbox
-        if not valid_views and grounded_entries:
-            logger.info(f"[QUERY:{query_id}] Threshold {settings.gemini_grounding_min_confidence} filtered all views; trying fallback...")
-            for entry in grounded_entries:
-                vid = str(entry.get("view_id", ""))
-                vis = bool(entry.get("visible", True))
-                conf = float(entry.get("confidence", 0.0)) if entry.get("confidence") is not None else 0.85
-                raw_bbox = entry.get("bbox") or entry.get("box_2d")
-                bbox_obj = self.response_parser.extract_bounding_box(raw_bbox)
-                if vid in images and vis and bbox_obj:
-                    valid_views.append((vid, conf, bbox_obj))
-
-        return valid_views
+        return self.view_collector.collect_valid_views(raw_data, parsed_response, images, query_id)
 
     def _attach_telemetry(
         self,
@@ -337,56 +590,24 @@ class VisualReasoningService:
         total_ms: float
     ) -> None:
         """
-        Populates PerformanceMetrics and debug telemetry matching existing API contracts.
+        Delegates telemetry recording to TelemetryCollector.
         """
-        gpu_mem = None
-        if torch.cuda.is_available():
-            try:
-                gpu_mem = torch.cuda.memory_allocated() / (1024 * 1024)
-            except Exception:
-                gpu_mem = None
-
-        parsed_response.metrics = PerformanceMetrics(
-            image_prep_ms=round(image_prep_ms, 2),
-            prompt_prep_ms=round(prompt_prep_ms, 2),
-            inference_ms=round(gemini_ms, 2),
-            parse_ms=round(parse_ms, 2),
-            gemini_ms=round(gemini_ms, 2),
-            sam_total_ms=round(sam_total_ms, 2),
-            total_ms=round(total_ms, 2),
-            device=self.model.get_info().get("device", "cpu"),
-            gpu_memory_allocated_mb=round(gpu_mem, 1) if gpu_mem else None
-        )
-
-        target_dict = None
-        if parsed_response.target:
-            target_dict = parsed_response.target.model_dump() if hasattr(parsed_response.target, 'model_dump') else parsed_response.target.dict()
-
-        parsed_response.debug_info = {
-            "model": self.model.get_info().get("name", "Gemini"),
-            "intent": parsed_response.intent.value,
-            "target": target_dict,
-            "views_sent": list(images.keys()),
-            "views_grounded_count": len(valid_views),
-            "grounded_views": [v[0] for v in valid_views],
-            "gemini_ms": round(gemini_ms, 1),
-            "sam_ms": round(sam_total_ms, 1),
-            "total_ms": round(total_ms, 1),
-            "sam_mask_count": len(parsed_response.segmentation.views) if parsed_response.segmentation else 0
+        timings = {
+            "image_prep_ms": image_prep_ms,
+            "prompt_prep_ms": prompt_prep_ms,
+            "gemini_ms": gemini_ms,
+            "parse_ms": parse_ms,
+            "sam_total_ms": sam_total_ms,
+            "total_ms": total_ms
         }
-
-        logger.info(
-            f"[QUERY:{query_id}] Finished in {total_ms:.1f}ms. "
-            f"Intent: {parsed_response.intent.value}, "
-            f"Segmentation: {bool(parsed_response.segmentation and parsed_response.segmentation.views)}"
+        self.telemetry_collector.attach_and_log(
+            parsed_response=parsed_response,
+            query_id=query_id,
+            model_info=self.model.get_info(),
+            images=images,
+            valid_views=valid_views,
+            timings=timings
         )
-        logger.info(f"[QUERY:{query_id}] === ANSWER ===")
-        logger.info(f"[QUERY:{query_id}] {parsed_response.answer}")
-        if parsed_response.segmentation and parsed_response.segmentation.views:
-            logger.info(f"[QUERY:{query_id}] === SAM SEGMENTATION ({len(parsed_response.segmentation.views)} views) ===")
-            for sm in parsed_response.segmentation.views:
-                logger.info(f"[QUERY:{query_id}] - [{sm.view_id}] sam_conf={sm.sam_confidence}, fg_pixels={sm.foreground_pixel_count}")
-        logger.info(f"[QUERY:{query_id}] ====================")
 
     def _robust_parse_response(self, raw_text: str, query_id: str, question: str = "") -> VisionQueryResponse:
         """

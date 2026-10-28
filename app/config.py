@@ -33,9 +33,17 @@ _load_dotenv_if_present()
 
 @dataclass
 class Settings:
-    # Gemini Cloud API support (Fast 1-2s inference)
+    # VLM Provider Selection: "gemini" (default) or "openrouter" / "openai"
+    vision_provider: str = os.getenv("VISION_PROVIDER", "gemini").lower()
+
+    # Gemini Cloud API support
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
-    gemini_model: str = os.getenv("VISION_GEMINI_MODEL", "gemini-3.6-flash")
+    gemini_model: str = os.getenv("VISION_GEMINI_MODEL", "gemini-flash-lite-latest")
+
+    # OpenAI-Compatible / OpenRouter API support
+    openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+    openrouter_model: str = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3.5-super-vl:free")
+    openrouter_base_url: str = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
     
     host: str = os.getenv("VISION_HOST", "127.0.0.1")
     port: int = int(os.getenv("VISION_PORT", "8010"))
