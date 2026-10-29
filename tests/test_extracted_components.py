@@ -111,3 +111,46 @@ def test_structured_response_parser_bounding_box_formats():
     # List [ymin, xmin, ymax, xmax] 0..1
     b3 = parser.extract_bounding_box([0.2, 0.1, 0.9, 0.8])
     assert b3.x_min == 0.1 and b3.y_min == 0.2 and b3.x_max == 0.8 and b3.y_max == 0.9
+
+def test_structured_response_parser_null_fields():
+    parser = StructuredResponseParser()
+    raw = json.dumps({
+        "intent": "SELECT_OBJECT",
+        "requires_segmentation": True,
+        "target": {"label": "bucket", "description": "metal bucket"},
+        "grounded_views": [
+            {
+                "view_id": "current",
+                "visible": True,
+                "bbox": {"x_min": 0.46, "y_min": 0.53, "x_max": 0.51, "y_max": 0.65},
+                "confidence": 0.95
+            }
+        ],
+        "answer": "Selected the metal bucket.",
+        "observations": [
+            {
+                "label": "bucket",
+                "view_id": "current",
+                "bbox": {"x_min": 0.46, "y_min": 0.53, "x_max": 0.51, "y_max": 0.65},
+                "confidence": 0.95,
+                "description": "Metal bucket"
+            }
+        ],
+        "possible_explanations": None,
+        "uncertainty": None,
+        "recommended_next_view": {
+            "required": False,
+            "reason": "Clear view",
+            "yaw_delta_deg": 0.0,
+            "pitch_delta_deg": 0.0,
+            "zoom_factor": 1.0
+        }
+    })
+    res = parser.parse_response(raw, query_id="test_null", question="Select bucket in the scene")
+    assert res.intent == IntentType.SELECT_OBJECT
+    assert res.requires_segmentation is True
+    assert res.target.label == "bucket"
+    assert res.possible_explanations == []
+    assert res._raw_data.get("grounded_views") is not None
+    assert len(res._raw_data["grounded_views"]) == 1
+

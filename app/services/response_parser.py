@@ -334,21 +334,26 @@ class StructuredResponseParser:
         candidate = self.json_sanitizer.extract_json_candidate(raw_text)
 
         if candidate:
+            data = None
             # Step 2: Attempt standard JSON parse
             try:
                 data = json.loads(candidate)
-                return self._build_typed_response(data, raw_text, question, query_id)
             except Exception as json_err:
                 logger.warning(f"[QUERY:{query_id}] Initial JSON parse failed ({json_err}). Attempting repair...")
+                # Step 3: Attempt heuristic JSON repair
+                repaired = self.json_sanitizer.repair_syntax(candidate)
+                try:
+                    data = json.loads(repaired)
+                    logger.info(f"[QUERY:{query_id}] JSON successfully repaired and decoded.")
+                except Exception as rep_err:
+                    logger.warning(f"[QUERY:{query_id}] JSON repair also failed ({rep_err}).")
+                    data = None
 
-            # Step 3: Attempt heuristic JSON repair
-            repaired = self.json_sanitizer.repair_syntax(candidate)
-            try:
-                data = json.loads(repaired)
-                logger.info(f"[QUERY:{query_id}] JSON successfully repaired and decoded.")
-                return self._build_typed_response(data, raw_text, question, query_id)
-            except Exception as rep_err:
-                logger.warning(f"[QUERY:{query_id}] JSON repair also failed ({rep_err}).")
+            if isinstance(data, dict):
+                try:
+                    return self._build_typed_response(data, raw_text, question, query_id)
+                except Exception as build_err:
+                    logger.error(f"[QUERY:{query_id}] Error constructing typed response: {build_err}", exc_info=True)
 
         # Step 4: Graceful fallback response when JSON cannot be parsed
         return self._build_fallback_response(raw_text, question)
@@ -379,8 +384,11 @@ class StructuredResponseParser:
         # Parse observations
         observations = self.observation_parser.parse_observations(data.get("observations", []), query_id)
 
-        # Parse recommended next view
-        rec_data = data.get("recommended_next_view", {})
+        # Parse recommended next view safely
+        rec_data = data.get("recommended_next_view")
+        if not isinstance(rec_data, dict):
+            rec_data = {}
+
         rec_view = RecommendedNextView(
             required=bool(rec_data.get("required", False)),
             reason=rec_data.get("reason"),
@@ -389,13 +397,21 @@ class StructuredResponseParser:
             zoom_factor=rec_data.get("zoom_factor")
         )
 
+        # Safely extract possible explanations handling null / non-list values
+        raw_explanations = data.get("possible_explanations")
+        possible_explanations = (
+            [str(e) for e in raw_explanations]
+            if isinstance(raw_explanations, list)
+            else []
+        )
+
         resp = VisionQueryResponse(
             answer=str(data.get("answer", fallback_text.strip())),
             intent=intent,
             requires_segmentation=requires_segmentation,
             target=target_obj,
             observations=observations,
-            possible_explanations=[str(e) for e in data.get("possible_explanations", [])],
+            possible_explanations=possible_explanations,
             uncertainty=data.get("uncertainty"),
             recommended_next_view=rec_view
         )
