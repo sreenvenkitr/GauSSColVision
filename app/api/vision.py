@@ -79,3 +79,21 @@ async def vision_query(
         
     from starlette.concurrency import run_in_threadpool
     return await run_in_threadpool(service.process_query, request, pil_images)
+
+@router.post("/api/v1/system/shutdown")
+async def shutdown():
+    """Request server shutdown from the web UI."""
+    import asyncio
+    import os
+    import signal
+    logger.info("Shutdown requested via web API endpoint.")
+
+    async def _delayed_kill():
+        await asyncio.sleep(0.3)
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+        except Exception as e:
+            logger.error(f"Error terminating process: {e}")
+
+    asyncio.create_task(_delayed_kill())
+    return {"status": "ok", "message": "GauSSColVision server is shutting down..."}
