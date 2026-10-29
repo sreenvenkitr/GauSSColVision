@@ -23,7 +23,7 @@ GauSSColVision Service (Port 8010)
 1. **Python**: 3.10 to 3.14 (64-bit).
 2. **PyTorch**: 2.0+ (CUDA GPU supported, CPU fallback available for SAM 2.1).
 3. **Gemini API Key**: Set in `.env` as `GEMINI_API_KEY=...`
-4. **GauSSCol Browser**: running on `http://localhost:5173`.
+4. **GauSSCol Web UI**: Run locally from [GauSSCol-Demo](https://github.com/sreenvenkitr/GauSSCol-Demo) via `run_demo.bat` (`http://localhost:8000`).
 
 ## Setup Instructions
 
